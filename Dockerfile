@@ -33,4 +33,4 @@ ENV PORT=8080
 
 # Start FastAPI app with uvicorn
 # (app:app = file app.py / module app.py with FastAPI() object named "app")
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080", "proxy-headers"]
