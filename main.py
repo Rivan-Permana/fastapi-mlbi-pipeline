@@ -14,6 +14,8 @@ import pandasai as pai
 from pandasai import SmartDataframe, SmartDatalake
 from pandasai_litellm.litellm import LiteLLM
 from pandasai.core.response.dataframe import DataFrameResponse
+import shutil
+from fastapi.responses import HTMLResponse
 
 app = FastAPI(title="ML BI Pipeline API", version="1.0.0")
 
@@ -24,14 +26,17 @@ app.add_middleware(
 )
 
 # --- ENV ---
-USE_GCP = os.getenv("USE_GCP", "0") == "0"   # ownerless mode kalau "0"
+# USE_GCP=1 -> pakai GCS/Firestore; USE_GCP=0 -> ownerless mode (skip GCP)
+USE_GCP = os.getenv("USE_GCP", "0") == "1"
 PROJECT_ID = os.getenv("PROJECT_ID")
 GCS_BUCKET = os.getenv("GCS_BUCKET")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-DATA_DIR = os.getenv("DATA_DIR", "/tmp")
+DATA_DIR = os.getenv("DATA_DIR", "/tmp")   # dipakai saat USE_GCP=0
 LOCAL_DATASETS_DIR = os.path.join(DATA_DIR, "datasets")
+LOCAL_CHARTS_DIR = os.path.join(DATA_DIR, "charts")
 os.makedirs(LOCAL_DATASETS_DIR, exist_ok=True)
+os.makedirs(LOCAL_CHARTS_DIR, exist_ok=True)
 
 # --- lazy GCP clients ---
 storage_client = None
@@ -88,7 +93,11 @@ def get_content(r):
         return str(r)
 
 def upload_to_gcs_or_local(file_path: str, destination: str) -> str:
+    """Dataset/Chart saver.
+       USE_GCP=1 -> ke GCS, return gs://...
+       USE_GCP=0 -> copy ke DATA_DIR (untuk chart, pakai _charts/local/ URL)."""
     if not USE_GCP:
+        # untuk dataset: cukup kembalikan path absolut (dipakai internal)
         return f"file://{os.path.abspath(file_path)}"
     try:
         blob = bucket.blob(destination)
@@ -138,6 +147,16 @@ def list_domain_csvs(domain: str):
             b.download_to_filename(local_path)
             csvs.append((filename, local_path))
     return csvs
+
+# serve chart lokal saat USE_GCP=0 (untuk FE)
+@app.get("/_charts/local/{path:path}", response_class=HTMLResponse, include_in_schema=False)
+def _serve_local_chart(path: str):
+    if USE_GCP:
+        raise HTTPException(status_code=404, detail="local charts disabled when USE_GCP=1")
+    abs_path = os.path.join(LOCAL_CHARTS_DIR, path)
+    if not os.path.exists(abs_path):
+        raise HTTPException(status_code=404, detail="chart not found")
+    return HTMLResponse(open(abs_path, "r", encoding="utf-8").read())
 
 # --- Endpoints ---
 @app.post("/upload_datasets/{domain}")
@@ -368,9 +387,21 @@ async def process_query(request: QueryRequest):
             if USE_GCP:
                 dst = f"charts/{request.domain}/{session_id}_{run_id}.html"
                 chart_url = upload_to_gcs_or_local(chart_path, dst)
-                os.remove(chart_path)
+                try:
+                    os.remove(chart_path)
+                except Exception:
+                    pass
             else:
-                chart_url = f"file://{os.path.abspath(chart_path)}"
+                # salin ke DATA_DIR/charts/<domain>/... dan serve lewat /_charts/local/<...>
+                rel = os.path.join(request.domain, f"{session_id}_{run_id}.html")
+                dst_abs = os.path.join(LOCAL_CHARTS_DIR, rel)
+                os.makedirs(os.path.dirname(dst_abs), exist_ok=True)
+                shutil.copyfile(chart_path, dst_abs)
+                chart_url = f"/_charts/local/{rel}"
+                try:
+                    os.remove(chart_path)
+                except Exception:
+                    pass
 
         execution_time = time.time() - start_time
 
