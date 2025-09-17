@@ -34,10 +34,27 @@ PROJECT_ID = os.getenv("PROJECT_ID")
 GCS_BUCKET = os.getenv("GCS_BUCKET")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# Initialize clients
-storage_client = storage.Client()
-bucket = storage_client.bucket(GCS_BUCKET)
-db = firestore.Client()
+# Initialize clients (lazy; diisi saat startup)
+storage_client = None
+bucket = None
+db = None
+
+@app.on_event("startup")
+def _startup_clients():
+    """Init Google clients saat app sudah naik (Cloud Run pakai ADC)."""
+    global storage_client, bucket, db
+    from google.cloud import storage as _storage
+    from google.cloud import firestore as _firestore
+
+    # Opsional: pakai PROJECT_ID kalau mau eksplisit
+    project = os.getenv("ml-bi-472208") or PROJECT_ID
+
+    storage_client = _storage.Client(project=project)
+    if not GCS_BUCKET:
+        raise RuntimeError("GCS_BUCKET env tidak diset")
+    bucket = storage_client.bucket(GCS_BUCKET)
+
+    db = _firestore.Client(project=project)
 
 # Pydantic models
 class QueryRequest(BaseModel):
