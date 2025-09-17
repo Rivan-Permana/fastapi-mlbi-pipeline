@@ -6,57 +6,57 @@ import uuid
 from datetime import datetime
 from typing import List, Optional
 import pandas as pd
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from google.cloud import storage, firestore
 from litellm import completion
 import pandasai as pai
 from pandasai import SmartDataframe, SmartDatalake
 from pandasai_litellm.litellm import LiteLLM
 from pandasai.core.response.dataframe import DataFrameResponse
 
-# Initialize FastAPI app
 app = FastAPI(title="ML BI Pipeline API", version="1.0.0")
 
-# CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
 )
 
-# Environment variables
+# --- ENV ---
+USE_GCP = os.getenv("USE_GCP", "0") == "0"   # ownerless mode kalau "0"
 PROJECT_ID = os.getenv("PROJECT_ID")
 GCS_BUCKET = os.getenv("GCS_BUCKET")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# Initialize clients (lazy; diisi saat startup)
+DATA_DIR = os.getenv("DATA_DIR", "/tmp")
+LOCAL_DATASETS_DIR = os.path.join(DATA_DIR, "datasets")
+os.makedirs(LOCAL_DATASETS_DIR, exist_ok=True)
+
+# --- lazy GCP clients ---
 storage_client = None
 bucket = None
 db = None
 
 @app.on_event("startup")
 def _startup_clients():
-    """Init Google clients saat app sudah naik (Cloud Run pakai ADC)."""
     global storage_client, bucket, db
-    from google.cloud import storage as _storage
-    from google.cloud import firestore as _firestore
+    if not USE_GCP:
+        print("⚠️ USE_GCP=0 → skip init GCS/Firestore (ownerless mode).")
+        return
+    try:
+        from google.cloud import storage as _storage
+        from google.cloud import firestore as _firestore
+        storage_client = _storage.Client(project=PROJECT_ID)
+        if not GCS_BUCKET:
+            raise RuntimeError("GCS_BUCKET env tidak diset")
+        bucket = storage_client.bucket(GCS_BUCKET)
+        db = _firestore.Client(project=PROJECT_ID)
+        print("✅ GCP clients initialized.")
+    except Exception as e:
+        print(f"⚠️ GCP init skipped: {e}")
 
-    # Opsional: pakai PROJECT_ID kalau mau eksplisit
-    project = os.getenv("ml-bi-472208") or PROJECT_ID
-
-    storage_client = _storage.Client(project=project)
-    if not GCS_BUCKET:
-        raise RuntimeError("GCS_BUCKET env tidak diset")
-    bucket = storage_client.bucket(GCS_BUCKET)
-
-    db = _firestore.Client(project=project)
-
-# Pydantic models
+# --- Models ---
 class QueryRequest(BaseModel):
     domain: str
     prompt: str
@@ -68,17 +68,15 @@ class QueryResponse(BaseModel):
     chart_url: Optional[str] = None
     execution_time: float
 
+# --- Helpers ---
 def get_content(r):
-    """Extract content from LLM response"""
     try:
         msg = r.choices[0].message
         return msg["content"] if isinstance(msg, dict) else msg.content
     except Exception:
         pass
-
     if isinstance(r, dict):
         return r.get("choices", [{}])[0].get("message", {}).get("content", "")
-
     try:
         chunks = []
         for ev in r:
@@ -89,113 +87,108 @@ def get_content(r):
     except Exception:
         return str(r)
 
-def upload_to_gcs(file_path: str, destination_blob_name: str):
-    """Upload file to Google Cloud Storage"""
+def upload_to_gcs_or_local(file_path: str, destination: str) -> str:
+    if not USE_GCP:
+        return f"file://{os.path.abspath(file_path)}"
     try:
-        blob = bucket.blob(destination_blob_name)
+        blob = bucket.blob(destination)
         blob.upload_from_filename(file_path)
-        return f"gs://{GCS_BUCKET}/{destination_blob_name}"
+        return f"gs://{GCS_BUCKET}/{destination}"
     except Exception as e:
         print(f"Error uploading to GCS: {e}")
-        return None
+        return ""
 
-def save_to_firestore(session_id: str, domain: str, prompt: str, response: str,
-                     execution_time: float, chart_url: Optional[str] = None):
-    """Save chat history to Firestore"""
+def save_history(session_id: str, payload: dict):
+    if not USE_GCP:
+        p = os.path.join(DATA_DIR, "history.json")
+        try:
+            existing = json.loads(open(p).read()) if os.path.exists(p) else {}
+        except Exception:
+            existing = {}
+        existing[session_id] = payload
+        with open(p, "w") as f:
+            json.dump(existing, f, indent=2, default=str)
+        return
     try:
         doc_ref = db.collection("chat_history").document(session_id)
-        doc_ref.set({
-            "domain": domain,
-            "prompt": prompt,
-            "response": response,
-            "chart_url": chart_url,
-            "execution_time": execution_time,
-            "timestamp": datetime.utcnow(),
-        })
+        doc_ref.set(payload)
     except Exception as e:
         print(f"Error saving to Firestore: {e}")
 
+def list_domain_csvs(domain: str):
+    csvs = []
+    if not USE_GCP:
+        domain_dir = os.path.join(LOCAL_DATASETS_DIR, domain)
+        if not os.path.isdir(domain_dir):
+            return []
+        for fn in os.listdir(domain_dir):
+            if fn.lower().endswith(".csv"):
+                csvs.append((fn, os.path.join(domain_dir, fn)))
+        return csvs
+
+    datasets_prefix = f"datasets/{domain}/"
+    try:
+        blobs = list(bucket.list_blobs(prefix=datasets_prefix))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"GCS error: {e}")
+    for b in blobs:
+        if b.name.endswith(".csv"):
+            filename = os.path.basename(b.name)
+            local_path = os.path.join("/tmp", filename)
+            b.download_to_filename(local_path)
+            csvs.append((filename, local_path))
+    return csvs
+
+# --- Endpoints ---
 @app.post("/upload_datasets/{domain}")
 async def upload_datasets(domain: str, files: List[UploadFile] = File(...)):
-    """Upload CSV datasets for a domain"""
     try:
-        uploaded_files = []
+        saved = []
+        domain_dir = os.path.join(LOCAL_DATASETS_DIR, domain)
+        os.makedirs(domain_dir, exist_ok=True)
 
         for file in files:
-            if not file.filename.endswith('.csv'):
-                raise HTTPException(status_code=400, detail=f"File {file.filename} is not a CSV file")
+            if not file.filename.lower().endswith(".csv"):
+                raise HTTPException(status_code=400, detail=f"File {file.filename} is not a CSV")
+            local_path = os.path.join(domain_dir, file.filename)
+            with open(local_path, "wb") as f:
+                f.write(await file.read())
+            url = upload_to_gcs_or_local(local_path, f"datasets/{domain}/{file.filename}")
+            saved.append({"filename": file.filename, "path": url or local_path})
 
-            # Save file locally first
-            local_path = f"/tmp/{file.filename}"
-            with open(local_path, "wb") as buffer:
-                content = await file.read()
-                buffer.write(content)
-
-            # Upload to GCS
-            gcs_path = f"datasets/{domain}/{file.filename}"
-            gcs_url = upload_to_gcs(local_path, gcs_path)
-
-            if gcs_url:
-                uploaded_files.append({
-                    "filename": file.filename,
-                    "gcs_path": gcs_url
-                })
-
-            # Clean up local file
-            os.remove(local_path)
-
-        return {"message": f"Uploaded {len(uploaded_files)} files for domain {domain}",
-                "files": uploaded_files}
-
+        return {"message": f"Uploaded {len(saved)} files for domain {domain}", "files": saved}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/query", response_model=QueryResponse)
 async def process_query(request: QueryRequest):
-    """Process ML BI Pipeline query"""
     start_time = time.time()
-
     try:
-        # Generate session ID if not provided
         session_id = request.session_id or str(uuid.uuid4())
 
-        # Download datasets from GCS
-        datasets_path = f"datasets/{request.domain}/"
-        blobs = list(bucket.list_blobs(prefix=datasets_path))
-
-        if not blobs:
+        csvs = list_domain_csvs(request.domain)
+        if not csvs:
             raise HTTPException(status_code=404, detail=f"No datasets found for domain {request.domain}")
 
-        # Download and load datasets
         dfs = {}
         data_info = {}
         data_describe = {}
 
-        for blob in blobs:
-            if blob.name.endswith('.csv'):
-                filename = os.path.basename(blob.name)
-                local_path = f"/tmp/{filename}"
-                blob.download_to_filename(local_path)
+        for filename, path in csvs:
+            df = pd.read_csv(path, sep="|")
+            dfs[filename] = df
+            buf = io.StringIO()
+            df.info(buf=buf)
+            data_info[filename] = buf.getvalue()
+            data_describe[filename] = df.describe(include="all").to_dict()
 
-                # Load dataframe
-                df = pd.read_csv(local_path, sep='|')
-                dfs[filename] = df
-
-                # Get info and describe
-                buf = io.StringIO()
-                df.info(buf=buf)
-                data_info[filename] = buf.getvalue()
-                data_describe[filename] = df.describe(include='all')
-
-                # Clean up
-                os.remove(local_path)
-
-        # Set API key
         api_key = GEMINI_API_KEY
         if not api_key:
             raise HTTPException(status_code=500, detail="No API key configured")
 
-        # Orchestrate LLMs
+        # --- Orchestrate LLMs (PROMPT ASLI TIDAK DIUBAH) ---
         orchestrator_response = completion(
             model="gemini/gemini-2.5-pro",
             messages=[
@@ -293,17 +286,15 @@ async def process_query(request: QueryRequest):
                 33. Your goal in `compiler_instruction` is to force brevity, decisions, and insights.
                 34. The compiler must NOT echo raw dataframes, code, or long tables; it opens with the business answer, quantifies drivers, and closes with next actions.
                 """},
-                {"role": "user", "content": f"User Prompt: {request.prompt} \nDatasets Domain name: {request.domain}. \ndf.info of each dfs key(file name)-value pair:\n{data_info}. \df.describe of each dfs key(file name)-value pair:\n{data_describe}."}
+                {"role": "user", "content":
+                 f"User Prompt: {request.prompt} \nDatasets Domain name: {request.domain}. "
+                 f"\ndf.info of each dfs key(file name)-value pair:\n{data_info}. "
+                 f"\n\\df.describe of each dfs key(file name)-value pair:\n{data_describe}."}
             ],
-            seed=1,
-            stream=False,
-            verbosity="low",
-            drop_params=True,
-            reasoning_effort="high",
+            seed=1, stream=False, verbosity="low", drop_params=True, reasoning_effort="high",
         )
 
         orchestrator_content = get_content(orchestrator_response)
-
         try:
             spec = json.loads(orchestrator_content)
         except json.JSONDecodeError:
@@ -316,156 +307,145 @@ async def process_query(request: QueryRequest):
         analyzer_prompt = spec["analyzer_prompt"]
         compiler_instruction = spec["compiler_instruction"]
 
-        # Setup LLM
-        llm = LiteLLM(model="gemini/gemini-2.5-pro", api_key=api_key)
+        llm = LiteLLM(model="gemini/gemini-2.5-pro", api_key=GEMINI_API_KEY)
         pai.config.set({"llm": llm})
 
-        # Data Manipulator
         data_manipulator = SmartDatalake(
             list(dfs.values()),
             config={
-                "llm": llm,
-                "seed": 1,
-                "stream": False,
-                "verbosity": "low",
-                "drop_params": True,
-                "save_charts": False,
-                "open_charts": False,
-                "conversational": False,
-                "enforce_privacy": True,
-                "reasoning_effort": "high",
+                "llm": llm, "seed": 1, "stream": False, "verbosity": "low",
+                "drop_params": True, "save_charts": False, "open_charts": False,
+                "conversational": False, "enforce_privacy": True, "reasoning_effort": "high",
             }
         )
         data_manipulator_response = data_manipulator.chat(manipulator_prompt)
+        df_processed = (data_manipulator_response.value
+                        if isinstance(data_manipulator_response, DataFrameResponse)
+                        else data_manipulator_response)
 
-        # Get processed dataframe
-        if isinstance(data_manipulator_response, DataFrameResponse):
-            df_processed = data_manipulator_response.value
-        else:
-            df_processed = data_manipulator_response
-
-        # Data Visualizer
-        data_visualizer = SmartDataframe(
-            df_processed,
-            config={
-                "llm": llm,
-                "seed": 1,
-                "stream": False,
-                "verbosity": "low",
-                "drop_params": True,
-                "save_charts": False,
-                "open_charts": False,
-                "conversational": False,
-                "enforce_privacy": True,
-                "reasoning_effort": "high",
-            }
-        )
-
-        # Set global run ID for file naming
         import datetime as _dt
         run_id = _dt.datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
         globals()["_RUN_ID"] = run_id
 
+        data_visualizer = SmartDataframe(
+            df_processed,
+            config={
+                "llm": llm, "seed": 1, "stream": False, "verbosity": "low",
+                "drop_params": True, "save_charts": False, "open_charts": False,
+                "conversational": False, "enforce_privacy": True, "reasoning_effort": "high",
+            }
+        )
         data_visualizer_response = data_visualizer.chat(visualizer_prompt)
 
-        # Data Analyzer
         data_analyzer = SmartDataframe(
             df_processed,
             config={
-                "llm": llm,
-                "seed": 1,
-                "stream": False,
-                "verbosity": "low",
-                "drop_params": True,
-                "save_charts": False,
-                "open_charts": False,
-                "conversational": True,
-                "enforce_privacy": False,
-                "reasoning_effort": "high",
+                "llm": llm, "seed": 1, "stream": False, "verbosity": "low",
+                "drop_params": True, "save_charts": False, "open_charts": False,
+                "conversational": True, "enforce_privacy": False, "reasoning_effort": "high",
             }
         )
         data_analyzer_response = data_analyzer.chat(analyzer_prompt)
 
-        # Response Compiler
         final_response = completion(
             model="gemini/gemini-2.5-pro",
             messages=[
                 {"role": "system", "content": compiler_instruction},
-                {"role": "user", "content": f"User Prompt:{request.prompt}. \nDatasets Domain name: {request.domain}. \ndf.info of each dfs key(file name)-value pair:\n{data_info}. \df.describe of each dfs key(file name)-value pair:\n{data_describe}. \nData Visualizer Response:{data_visualizer_response.value}. \nData Analyzer Response:{data_analyzer_response}."},
+                {"role": "user", "content":
+                 f"User Prompt:{request.prompt}. \nDatasets Domain name: {request.domain}. "
+                 f"\ndf.info of each dfs key(file name)-value pair:\n{data_info}. "
+                 f"\n\\df.describe of each dfs key(file name)-value pair:\n{data_describe}. "
+                 f"\nData Visualizer Response:{getattr(data_visualizer_response,'value',None)}. "
+                 f"\nData Analyzer Response:{data_analyzer_response}."},
             ],
-            seed=1,
-            stream=False,
-            verbosity="medium",
-            drop_params=True,
-            reasoning_effort="high",
+            seed=1, stream=False, verbosity="medium", drop_params=True, reasoning_effort="high",
         )
         final_content = get_content(final_response)
 
-        # Upload chart to GCS if it exists
         chart_url = None
-        if hasattr(data_visualizer_response, 'value') and data_visualizer_response.value:
-            chart_path = data_visualizer_response.value
-            if os.path.exists(chart_path):
-                gcs_chart_path = f"charts/{request.domain}/{session_id}_{run_id}.html"
-                chart_url = upload_to_gcs(chart_path, gcs_chart_path)
-                os.remove(chart_path)  # Clean up local file
+        chart_path = getattr(data_visualizer_response, "value", None)
+        if chart_path and os.path.exists(chart_path):
+            if USE_GCP:
+                dst = f"charts/{request.domain}/{session_id}_{run_id}.html"
+                chart_url = upload_to_gcs_or_local(chart_path, dst)
+                os.remove(chart_path)
+            else:
+                chart_url = f"file://{os.path.abspath(chart_path)}"
 
-        # Calculate execution time
         execution_time = time.time() - start_time
 
-        # Save to Firestore
-        save_to_firestore(session_id, request.domain, request.prompt, final_content, execution_time, chart_url)
+        save_history(session_id, {
+            "domain": request.domain,
+            "prompt": request.prompt,
+            "response": final_content,
+            "chart_url": chart_url,
+            "execution_time": execution_time,
+            "timestamp": datetime.utcnow(),
+        })
 
         return QueryResponse(
-            session_id=session_id,
-            response=final_content,
-            chart_url=chart_url,
-            execution_time=execution_time
+            session_id=session_id, response=final_content,
+            chart_url=chart_url, execution_time=execution_time
         )
-
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/history/{session_id}")
 async def get_chat_history(session_id: str):
-    """Get chat history for a session"""
     try:
+        if not USE_GCP:
+            p = os.path.join(DATA_DIR, "history.json")
+            if not os.path.exists(p):
+                raise HTTPException(status_code=404, detail="Session not found")
+            data = json.loads(open(p).read())
+            if session_id in data:
+                return data[session_id]
+            raise HTTPException(status_code=404, detail="Session not found")
         doc_ref = db.collection("chat_history").document(session_id)
         doc = doc_ref.get()
-
         if doc.exists:
             return doc.to_dict()
         else:
             raise HTTPException(status_code=404, detail="Session not found")
-
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/domains/{domain}/datasets")
 async def list_domain_datasets(domain: str):
-    """List all datasets for a domain"""
     try:
-        datasets_path = f"datasets/{domain}/"
-        blobs = list(bucket.list_blobs(prefix=datasets_path))
-
-        datasets = []
-        for blob in blobs:
-            if blob.name.endswith('.csv'):
-                datasets.append({
+        items = []
+        if not USE_GCP:
+            domain_dir = os.path.join(LOCAL_DATASETS_DIR, domain)
+            if os.path.isdir(domain_dir):
+                for fn in os.listdir(domain_dir):
+                    if fn.lower().endswith(".csv"):
+                        p = os.path.join(domain_dir, fn)
+                        items.append({
+                            "filename": fn,
+                            "gcs_path": f"file://{os.path.abspath(p)}",
+                            "size": os.path.getsize(p),
+                            "updated": datetime.utcfromtimestamp(os.path.getmtime(p)).isoformat(),
+                        })
+            return {"domain": domain, "datasets": items}
+        prefix = f"datasets/{domain}/"
+        for blob in bucket.list_blobs(prefix=prefix):
+            if blob.name.endswith(".csv"):
+                items.append({
                     "filename": os.path.basename(blob.name),
                     "gcs_path": f"gs://{GCS_BUCKET}/{blob.name}",
                     "size": blob.size,
                     "updated": blob.updated.isoformat() if blob.updated else None
                 })
-
-        return {"domain": domain, "datasets": datasets}
-
+        return {"domain": domain, "datasets": items}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
     return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
 
 if __name__ == "__main__":
